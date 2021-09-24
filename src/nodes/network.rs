@@ -13,6 +13,28 @@ use std::sync::mpsc;
 
 use nanoserde::{DeBin, SerBin};
 
+pub trait Socket: Send {
+    fn send(&self, _: &[u8]) -> Option<usize>;
+    fn recv(&self, buf: &mut [u8]) -> Option<usize>;
+    fn try_clone(&self) -> Option<Box<dyn Socket>>;
+}
+
+impl Socket for std::net::UdpSocket {
+    fn send(&self, buf: &[u8]) -> Option<usize> {
+        std::net::UdpSocket::send(self, buf).ok()
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> Option<usize> {
+        std::net::UdpSocket::recv(self, buf).ok()
+    }
+
+    fn try_clone(&self) -> Option<Box<dyn Socket>> {
+        std::net::UdpSocket::try_clone(self)
+            .ok()
+            .map(|socket| Box::new(socket) as Box<dyn Socket>)
+    }
+}
+
 #[derive(Debug, DeBin, SerBin)]
 pub enum Message {
     /// Empty message, used for connection test
@@ -25,6 +47,9 @@ pub enum Message {
         // current simulation frame
         frame: u64,
         input: Input,
+    },
+    Ack {
+        frame: u64,
     },
 }
 
@@ -43,6 +68,7 @@ pub struct Network {
     // all the inputs from the beginning of the game
     // will optimize memory later
     frames_buffer: Vec<[Option<Input>; 2]>,
+    acked_frames: Vec<bool>,
 }
 
 // // get a bitmask of received remote inputs out of frames_buffer
@@ -65,13 +91,11 @@ impl Network {
 
     pub fn new(
         id: usize,
-        socket: std::net::UdpSocket,
+        socket: Box<dyn Socket>,
         input_scheme: InputScheme,
         player1: Handle<Player>,
         player2: Handle<Player>,
     ) -> Network {
-        socket.set_nonblocking(true).unwrap();
-
         let (tx, rx) = mpsc::channel::<Message>();
 
         let (tx1, rx1) = mpsc::channel::<Message>();
@@ -82,14 +106,10 @@ impl Network {
                 let socket = socket;
                 loop {
                     let mut data = [0; 256];
-                    match socket.recv_from(&mut data) {
-                        Err(..) => {} //println!("waiting for other player"),
-                        Ok((count, _)) => {
-                            assert!(count < 256);
-                            let message = DeBin::deserialize_bin(&data[0..count]).unwrap();
+                    if let Some(count) = socket.recv(&mut data) {
+                        let message = DeBin::deserialize_bin(&data[0..count]).unwrap();
 
-                            tx1.send(message).unwrap();
-                        }
+                        tx1.send(message).unwrap();
                     }
                 }
             });
@@ -102,20 +122,21 @@ impl Network {
 
                     let socket = socket.try_clone().unwrap();
 
-                    // std::thread::spawn(move || {
-                    //     std::thread::sleep(std::time::Duration::from_millis(
-                    //         macroquad::rand::gen_range(0, 150),
-                    //     ));
-                    //     if macroquad::rand::gen_range(0, 100) > 20 {
-                    //         let _ = socket.send(&data);
-                    //     }
-                    // });
-                    socket.send(&data).unwrap();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            macroquad::rand::gen_range(100, 350),
+                        ));
+                        if macroquad::rand::gen_range(0, 100) > 90 {
+                            let _ = socket.send(&data);
+                        }
+                    });
+                    //socket.send(&data);
                 }
             }
         });
 
         let mut frames_buffer = vec![];
+        let mut acked_frames = vec![];
 
         // Fill first CONSTANT_DELAY frames
         // this will not really change anything - the fish will just always spend
@@ -129,6 +150,7 @@ impl Network {
             frame[id as usize] = Some(Input::default());
 
             frames_buffer.push(frame);
+            acked_frames.push(false);
         }
 
         Network {
@@ -140,6 +162,7 @@ impl Network {
             tx,
             rx: rx1,
             frames_buffer,
+            acked_frames,
         }
     }
 }
@@ -155,18 +178,37 @@ impl Node for Network {
         // and ID will be part of a protocol
         let remote_id = if node.self_id == 1 { 0 } else { 1 };
 
+        // Receive other fish input
+        while let Ok(message) = node.rx.try_recv() {
+            match message {
+                Message::Input { frame, input } => {
+                    if frame >= node.frames_buffer.len() as _ {
+                        node.frames_buffer.resize(frame as usize + 1, [None, None]);
+                        node.acked_frames.resize(frame as usize + 1, false);
+                    }
+
+                    node.frames_buffer[frame as usize][remote_id] = Some(input);
+                    node.tx.send(Message::Ack { frame }).unwrap();
+                }
+                Message::Ack { frame } => {
+                    node.acked_frames[frame as usize] = true;
+                }
+                _ => {}
+            }
+        }
+
         // re-send frames missing on remote fish
-        // very excessive send, we should check ACK and
-        // send only frames actually missing on the remote fish
         for i in
             (node.frame as i64 - Self::CONSTANT_DELAY as i64 * 2).max(0) as u64 as u64..node.frame
         {
-            node.tx
-                .send(Message::Input {
-                    frame: i,
-                    input: node.frames_buffer[i as usize][node.self_id].unwrap(),
-                })
-                .unwrap();
+            if !node.acked_frames[i as usize] {
+                node.tx
+                    .send(Message::Input {
+                        frame: i,
+                        input: node.frames_buffer[i as usize][node.self_id].unwrap(),
+                    })
+                    .unwrap();
+            }
         }
 
         // we just received only CONSTANT_DELAY frames, assuming we certainly
@@ -178,29 +220,10 @@ impl Node for Network {
             }
         }
 
-        // Receive other fish input
-        while let Ok(message) = node.rx.try_recv() {
-            if let Message::Input { frame, input } = message {
-                // frame from the future, need to wait until will simulate
-                // the game enough to use this data
-                if frame < node.frames_buffer.len() as _ {
-                    node.frames_buffer[frame as usize][remote_id] = Some(input);
-                }
-            }
-        }
-
-        // // notify the other fish on the state of our input buffer
-        // node.tx
-        //     .send(Message::Ack {
-        //         frame: node.frame,
-        //         ack: remote_inputs_ack(remote_id, &node.frames_buffer),
-        //     })
-        //     .unwrap();
-
         // we have an input for "-CONSTANT_DELAY" frame, so we can
         // advance the simulation
         if let [Some(p1_input), Some(p2_input)] =
-            node.frames_buffer[node.frames_buffer.len() - Self::CONSTANT_DELAY]
+            node.frames_buffer[node.frame as usize - Self::CONSTANT_DELAY]
         {
             scene::get_node(node.player1).apply_input(p1_input);
             scene::get_node(node.player2).apply_input(p2_input);
@@ -210,11 +233,12 @@ impl Node for Network {
                 (capability.network_update)(node);
             }
 
-            let mut new_frame = [None, None];
-            new_frame[node.self_id] = Some(own_input);
-
-            node.frames_buffer.push(new_frame);
-
+            if node.frame >= node.frames_buffer.len() as _ {
+                node.frames_buffer
+                    .resize(node.frame as usize + 1, [None, None]);
+                node.acked_frames.resize(node.frame as usize + 1, false);
+            }
+            node.frames_buffer[node.frame as usize][node.self_id] = Some(own_input);
             node.frame += 1;
         }
     }
