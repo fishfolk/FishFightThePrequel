@@ -14,10 +14,12 @@ macroquad-platformer = "0.1"
 macroquad-tiled = "0.1"
 macroquad-profiler = "0.1"
 macroquad-particles = {version = "0.1", features = ["nanoserde"] }
+steamworks = { version = "0.7.0", optional = true }
 
 quad-gamepad = "0.2.0-alpha"
 
-stunclient = { git = "https://github.com/not-fl3/rust-stunclient", default-features = false }
+[patch.crates-io]
+steamworks = { path = "../steamworks-rs" }
 
 #[patch.crates-io]
 #macroquad = { git = "https://github.com/not-fl3/macroquad" }

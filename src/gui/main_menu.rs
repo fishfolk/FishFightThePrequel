@@ -8,7 +8,6 @@ use crate::{gui::GuiResources, input::InputScheme, nodes::network::Message, Game
 
 use std::net::UdpSocket;
 
-const RELAY_ADDR: &str = "173.0.157.169:35000";
 const WINDOW_WIDTH: f32 = 700.;
 const WINDOW_HEIGHT: f32 = 400.;
 
@@ -86,9 +85,8 @@ fn local_game_ui(ui: &mut ui::Ui, players: &mut Vec<InputScheme>) -> Option<Game
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ConnectionKind {
     Lan,
-    Stun,
-    Relay,
-    Unknown,
+    #[cfg(feature = "steamworks")]
+    Steam,
 }
 
 #[derive(Debug, PartialEq)]
@@ -97,130 +95,53 @@ enum ConnectionStatus {
     Connected,
 }
 
-struct Connection {
-    kind: ConnectionKind,
-    socket: Option<UdpSocket>,
+struct LanConnection {
+    socket: UdpSocket,
     local_addr: String,
     opponent_addr: String,
-    relay_addr: String,
     status: ConnectionStatus,
 }
 
-impl Connection {
-    fn new() -> Connection {
-        Connection {
-            kind: ConnectionKind::Unknown,
-            socket: None,
-            local_addr: "".to_string(),
+impl LanConnection {
+    fn new() -> LanConnection {
+        use std::net::SocketAddr;
+
+        let addrs = [
+            SocketAddr::from(([0, 0, 0, 0], 3400)),
+            SocketAddr::from(([0, 0, 0, 0], 3401)),
+            SocketAddr::from(([0, 0, 0, 0], 3402)),
+            SocketAddr::from(([0, 0, 0, 0], 3403)),
+        ];
+
+        let socket = UdpSocket::bind(&addrs[..]).unwrap();
+
+        let local_addr = format!("{}", socket.local_addr().unwrap());
+        socket.set_nonblocking(true).unwrap();
+
+        LanConnection {
+            socket,
+            local_addr,
             opponent_addr: "".to_string(),
-            relay_addr: RELAY_ADDR.to_string(),
             status: ConnectionStatus::Unknown,
         }
     }
 
-    fn update(&mut self, kind: ConnectionKind) {
-        if let Some(socket) = self.socket.as_mut() {
-            let mut buf = [0; 100];
-            if socket.recv(&mut buf).is_ok() {
-                let _message: Message = nanoserde::DeBin::deserialize_bin(&buf[..]).ok().unwrap();
-                self.status = ConnectionStatus::Connected;
-            }
-        }
-
-        if kind != self.kind {
-            self.kind = kind;
-            self.status = ConnectionStatus::Unknown;
-
-            use std::net::SocketAddr;
-
-            let addrs = [
-                SocketAddr::from(([0, 0, 0, 0], 3400)),
-                SocketAddr::from(([0, 0, 0, 0], 3401)),
-                SocketAddr::from(([0, 0, 0, 0], 3402)),
-                SocketAddr::from(([0, 0, 0, 0], 3403)),
-            ];
-            match kind {
-                ConnectionKind::Lan => {
-                    let socket = UdpSocket::bind(&addrs[..]).unwrap();
-
-                    self.local_addr = format!("{}", socket.local_addr().unwrap());
-                    socket.set_nonblocking(true).unwrap();
-
-                    self.socket = Some(socket);
-                }
-                ConnectionKind::Stun => {
-                    let socket = UdpSocket::bind(&addrs[..]).unwrap();
-
-                    let sc = stunclient::StunClient::with_google_stun_server();
-                    self.local_addr = format!("{}", sc.query_external_address(&socket).unwrap());
-                    socket.set_nonblocking(true).unwrap();
-
-                    self.socket = Some(socket);
-                }
-                ConnectionKind::Relay => {
-                    let socket = UdpSocket::bind(&addrs[..]).unwrap();
-                    socket.connect(&self.relay_addr).unwrap();
-                    socket.set_nonblocking(true).unwrap();
-
-                    loop {
-                        let _ = socket
-                            .send(&nanoserde::SerBin::serialize_bin(&Message::RelayRequestId));
-
-                        let mut buf = [0; 100];
-                        if socket.recv(&mut buf).is_ok() {
-                            let message: Message =
-                                nanoserde::DeBin::deserialize_bin(&buf[..]).ok().unwrap();
-                            if let Message::RelayIdAssigned(id) = message {
-                                self.local_addr = format!("{}", id);
-                                break;
-                            }
-                        }
-                    }
-                    self.socket = Some(socket);
-                }
-                _ => {}
-            }
+    fn update(&mut self) {
+        let mut buf = [0; 100];
+        if self.socket.recv(&mut buf).is_ok() {
+            let _message: Message = nanoserde::DeBin::deserialize_bin(&buf[..]).ok().unwrap();
+            self.status = ConnectionStatus::Connected;
         }
     }
 
     pub fn connect(&mut self) {
-        let socket = self.socket.as_mut().unwrap();
-        match self.kind {
-            ConnectionKind::Lan | ConnectionKind::Stun => {
-                socket.connect(&self.opponent_addr).unwrap();
-            }
-            ConnectionKind::Relay => {
-                let other_id = self.opponent_addr.parse::<u64>().unwrap();
-                loop {
-                    let _ = socket.send(&nanoserde::SerBin::serialize_bin(
-                        &Message::RelayConnectTo(other_id),
-                    ));
-
-                    let mut buf = [0; 100];
-                    if socket.recv(&mut buf).is_ok() {
-                        let message: Message =
-                            nanoserde::DeBin::deserialize_bin(&buf[..]).ok().unwrap();
-                        if let Message::RelayConnected = message {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        self.socket.connect(&self.opponent_addr).unwrap();
     }
     pub fn probe(&mut self) -> Option<()> {
-        assert!(self.socket.is_some());
-
-        if self.kind == ConnectionKind::Relay {
-            return Some(());
-        }
-        let socket = self.socket.as_mut().unwrap();
-
-        socket.connect(&self.opponent_addr).ok()?;
+        self.socket.connect(&self.opponent_addr).ok()?;
 
         for _ in 0..100 {
-            socket
+            self.socket
                 .send(&nanoserde::SerBin::serialize_bin(&Message::Idle))
                 .ok()?;
         }
@@ -228,11 +149,230 @@ impl Connection {
         None
     }
 }
+
+#[cfg(feature = "steamworks")]
+mod steam {
+    use std::sync::{Arc, Mutex};
+    use steamworks::{
+        CallbackHandle, ChatMemberStateChange, Client, LobbyChatUpdate, LobbyId, Matchmaking,
+        P2PSessionConnectFail, P2PSessionRequest, SingleClient, SteamId,
+    };
+
+    #[derive(Debug)]
+    pub enum Error {
+        SteamError(steamworks::SteamError),
+        WrongLobby,
+        NoOpponent,
+        CreateLobbyFailed,
+    }
+
+    impl From<steamworks::SteamError> for Error {
+        fn from(error: steamworks::SteamError) -> Error {
+            Error::SteamError(error)
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum SteamStatus {
+        WaitingForLobbies,
+        CreatingLobby,
+        WaitingForConnection(LobbyId),
+        Connecting,
+        Error(Error),
+        WaitingForProbe,
+        Ready,
+    }
+
+    pub struct SteamConnection {
+        pub client: Client<steamworks::ClientManager>,
+        pub self_id: SteamId,
+        pub opponent_id: Option<SteamId>,
+        single: SingleClient<steamworks::ClientManager>,
+        matchmaking: Matchmaking<steamworks::ClientManager>,
+        pub status: SteamStatus,
+        lobbies: Arc<Mutex<Option<Result<Vec<LobbyId>, steamworks::SteamError>>>>,
+        lobby_id: Arc<Mutex<Option<Result<LobbyId, ()>>>>,
+        incoming_connection: Arc<Mutex<Option<SteamId>>>,
+        _callbacks: Vec<CallbackHandle<steamworks::ClientManager>>,
+    }
+
+    impl SteamConnection {
+        pub fn new() -> Result<SteamConnection, Error> {
+            let (client, single) = Client::init()?;
+
+            let self_id = client.user().steam_id();
+            println!("Self user id: {:?}", self_id);
+
+            let mut _callbacks = vec![];
+            let cb = client.register_callback({
+                let client = client.clone();
+                move |p: P2PSessionRequest| {
+                    println!("Got P2PSessionRequest callback: {:?}", p);
+
+                    let networking = client.networking();
+                    networking.accept_p2p_session(p.remote);
+                }
+            });
+            _callbacks.push(cb);
+
+            let cb = client.register_callback({
+                move |p: P2PSessionConnectFail| {
+                    println!("Got P2PSessionConnectFail callback: {:?}", p);
+                }
+            });
+            _callbacks.push(cb);
+
+            let incoming_connection = Arc::new(Mutex::new(None));
+            let cb = client.register_callback({
+                let incoming_connection = incoming_connection.clone();
+
+                move |p: LobbyChatUpdate| {
+                    println!("Got LobbyChatUpdate callback: {:?}", p);
+
+                    match p.member_state_change {
+                        ChatMemberStateChange::Entered => {
+                            *incoming_connection.lock().unwrap() = Some(p.user_changed);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            _callbacks.push(cb);
+
+            let matchmaking = client.matchmaking();
+
+            let lobbies = Arc::new(Mutex::new(None));
+
+            matchmaking.request_lobby_list({
+                let lobbies = lobbies.clone();
+                move |res| {
+                    *lobbies.lock().unwrap() = Some(res);
+                }
+            });
+
+            Ok(SteamConnection {
+                client,
+                single,
+                self_id,
+                opponent_id: None,
+                matchmaking,
+                incoming_connection,
+                status: SteamStatus::WaitingForLobbies,
+                lobbies,
+                lobby_id: Arc::new(Mutex::new(None)),
+                _callbacks,
+            })
+        }
+
+        pub fn update(&mut self) {
+            self.single.run_callbacks();
+
+            match self.status {
+                SteamStatus::WaitingForLobbies => {
+                    if let Some(lobbies) = &*self.lobbies.lock().unwrap() {
+                        match lobbies {
+                            Ok(lobbies) if lobbies.is_empty() => {
+                                self.status = SteamStatus::CreatingLobby;
+                                let lobby_id = self.lobby_id.clone();
+                                self.matchmaking.create_lobby(
+                                    steamworks::LobbyType::Public,
+                                    2,
+                                    move |id| {
+                                        *lobby_id.lock().unwrap() = Some(id.map_err(|_| ()));
+                                    },
+                                );
+                            }
+                            Ok(lobbies) => {
+                                self.status = SteamStatus::Connecting;
+                                let lobby = self.lobby_id.clone();
+                                self.matchmaking.join_lobby(lobbies[0], move |res| {
+                                    *lobby.lock().unwrap() = Some(res);
+                                });
+                            }
+                            Err(err) => {
+                                self.status = SteamStatus::Error(err.clone().into());
+                            }
+                        }
+                    }
+                }
+                SteamStatus::WaitingForConnection(_) => {
+                    if let Some(opponent_id) = &*self.incoming_connection.lock().unwrap() {
+                        self.opponent_id = Some(*opponent_id);
+                        println!(
+                            "Ready to connect. Self_id: {:?}, opponent_id: {:?}",
+                            self.self_id,
+                            self.opponent_id.unwrap()
+                        );
+
+                        self.status = SteamStatus::WaitingForProbe;
+                        return;
+                    }
+                }
+                SteamStatus::CreatingLobby => {
+                    if let Some(lobby_id) = &*self.lobby_id.lock().unwrap() {
+                        match lobby_id {
+                            Err(_) => {
+                                self.status = SteamStatus::Error(Error::CreateLobbyFailed);
+                            }
+                            Ok(lobby) => {
+                                self.status = SteamStatus::WaitingForConnection(*lobby);
+                            }
+                        }
+                    }
+                }
+                SteamStatus::Connecting => {
+                    if let Some(Err(_)) = &*self.lobby_id.lock().unwrap() {
+                        self.status = SteamStatus::Error(Error::WrongLobby);
+                        return;
+                    }
+                    if let Some(Ok(lobby)) = &*self.lobby_id.lock().unwrap() {
+                        let opponents = self.matchmaking.lobby_members(*lobby);
+
+                        if opponents.len() != 2 {
+                            self.status = SteamStatus::Error(Error::WrongLobby);
+                            return;
+                        }
+                        println!("opponents: {:?}", opponents);
+
+                        let opponent = opponents.iter().find(|opponent| **opponent != self.self_id);
+                        if opponent.is_none() {
+                            self.status = SteamStatus::Error(Error::NoOpponent);
+                        }
+                        self.opponent_id = Some(*opponent.unwrap());
+
+                        println!(
+                            "Ready to connect. Self_id: {:?}, opponent_id: {:?}, in lobby {:?}",
+                            self.self_id,
+                            self.opponent_id.unwrap(),
+                            lobby
+                        );
+                        self.status = SteamStatus::WaitingForProbe;
+                    }
+                }
+                SteamStatus::WaitingForProbe => {
+                    if self.client.networking().is_p2p_packet_available().is_some() {
+                        self.status = SteamStatus::Ready;
+                    }
+                    let message = &nanoserde::SerBin::serialize_bin(&super::Message::Idle);
+                    self.client.networking().send_p2p_packet(
+                        self.opponent_id.unwrap(),
+                        steamworks::SendType::Unreliable,
+                        message,
+                    );
+                }
+                SteamStatus::Ready => {}
+                SteamStatus::Error(_) => {}
+            }
+        }
+    }
+}
+
 struct NetworkUiState {
     input_scheme: InputScheme,
     connection_kind: ConnectionKind,
-    connection: Connection,
-    custom_relay: bool,
+    lan_connection: Option<LanConnection>,
+    #[cfg(feature = "steamworks")]
+    steam_connection: Option<Result<steam::SteamConnection, steam::Error>>,
 }
 
 fn is_gamepad_btn_pressed(gui_resources: &GuiResources, btn: quad_gamepad::GamepadButton) -> bool {
@@ -248,73 +388,113 @@ fn is_gamepad_btn_pressed(gui_resources: &GuiResources, btn: quad_gamepad::Gamep
 
 fn network_game_ui(ui: &mut ui::Ui, state: &mut NetworkUiState) -> Option<GameType> {
     let mut connection_kind_ui = state.connection_kind as usize;
-    widgets::ComboBox::new(hash!(), &["Lan network", "STUN server", "Relay server"])
+
+    #[cfg(not(feature = "steamworks"))]
+    let options = &["Lan network"];
+    #[cfg(feature = "steamworks")]
+    let options = &["Lan network", "Steam"];
+
+    widgets::ComboBox::new(hash!(), options)
         .ratio(0.4)
-        .label("Connection type")
+        .label("LanConnection type")
         .ui(ui, &mut connection_kind_ui);
+
     match connection_kind_ui {
-        x if x == ConnectionKind::Stun as usize => {
-            state.connection_kind = ConnectionKind::Stun;
-        }
         x if x == ConnectionKind::Lan as usize => {
             state.connection_kind = ConnectionKind::Lan;
         }
-        x if x == ConnectionKind::Relay as usize => {
-            state.connection_kind = ConnectionKind::Relay;
+        #[cfg(feature = "steamworks")]
+        x if x == ConnectionKind::Steam as usize => {
+            state.connection_kind = ConnectionKind::Steam;
         }
         _ => unreachable!(),
     }
 
-    if state.connection_kind == ConnectionKind::Relay {
-        widgets::Checkbox::new(hash!())
-            .label("Use custom relay server")
-            .ratio(0.4)
-            .ui(ui, &mut state.custom_relay);
+    if state.connection_kind == ConnectionKind::Lan {
+        if state.lan_connection.is_none() {
+            state.lan_connection = Some(LanConnection::new());
+        }
+        let connection = state.lan_connection.as_mut().unwrap();
+        let mut self_addr = connection.local_addr.clone();
 
-        if state.custom_relay {
-            widgets::InputText::new(hash!())
-                .ratio(0.4)
-                .label("Self addr")
-                .ui(ui, &mut state.connection.relay_addr);
+        widgets::InputText::new(hash!())
+            .ratio(0.4)
+            .label("Self addr")
+            .ui(ui, &mut self_addr);
+
+        widgets::InputText::new(hash!())
+            .ratio(0.4)
+            .label("Opponent addr")
+            .ui(ui, &mut connection.opponent_addr);
+
+        connection.update();
+
+        if ui.button(None, "Probe connection") {
+            connection.probe();
+        }
+
+        ui.label(
+            None,
+            &format!("LanConnection status: {:?}", connection.status),
+        );
+
+        if connection.status == ConnectionStatus::Connected
+            && ui.button(None, "Connect (A) (Enter)")
+        {
+            connection.connect();
+
+            return Some(GameType::Network {
+                socket: Box::new(connection.socket.try_clone().unwrap()),
+                id: if connection.local_addr > connection.opponent_addr {
+                    0
+                } else {
+                    1
+                },
+                input_scheme: state.input_scheme,
+            });
         }
     }
 
-    let mut self_addr = state.connection.local_addr.clone();
-    widgets::InputText::new(hash!())
-        .ratio(0.4)
-        .label("Self addr")
-        .ui(ui, &mut self_addr);
+    #[cfg(feature = "steamworks")]
+    if state.connection_kind == ConnectionKind::Steam {
+        if state.steam_connection.is_none() {
+            state.steam_connection = Some(steam::SteamConnection::new());
+        }
+        let connection = state.steam_connection.as_mut().unwrap();
+        match connection {
+            Err(err) => {
+                ui.label(None, &format!("Error: {:?}", err));
+                if ui.button(None, "Try again") {
+                    state.steam_connection = None;
+                }
+            }
+            Ok(connection) => {
+                connection.update();
 
-    widgets::InputText::new(hash!())
-        .ratio(0.4)
-        .label("Opponent addr")
-        .ui(ui, &mut state.connection.opponent_addr);
+                ui.label(None, &format!("Status: {:?}", connection.status));
 
-    state.connection.update(state.connection_kind);
+                if let steam::SteamStatus::Ready = connection.status {
+                    if ui.button(None, "Connect") {
+                        use crate::nodes::network::steam::SteamSocket;
 
-    if ui.button(None, "Probe connection") {
-        state.connection.probe();
-    }
-
-    ui.label(
-        None,
-        &format!("Connection status: {:?}", state.connection.status),
-    );
-
-    if state.connection.status == ConnectionStatus::Connected
-        && ui.button(None, "Connect (A) (Enter)")
-    {
-        state.connection.connect();
-
-        return Some(GameType::Network {
-            socket: state.connection.socket.take().unwrap(),
-            id: if state.connection.local_addr > state.connection.opponent_addr {
-                0
-            } else {
-                1
-            },
-            input_scheme: state.input_scheme,
-        });
+                        let opponent_id = connection.opponent_id.unwrap();
+                        return Some(GameType::Network {
+                            socket: Box::new(SteamSocket {
+                                client: connection.client.clone(),
+                                networking: connection.client.networking(),
+                                opponent_id,
+                            }),
+                            id: if connection.self_id > opponent_id {
+                                0
+                            } else {
+                                1
+                            },
+                            input_scheme: state.input_scheme,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     ui.label(
@@ -344,10 +524,11 @@ pub async fn game_type() -> GameType {
     let mut players = vec![];
 
     let mut network_ui_state = NetworkUiState {
-        connection: Connection::new(),
+        lan_connection: None,
+        #[cfg(feature = "steamworks")]
+        steam_connection: None,
         input_scheme: InputScheme::KeyboardLeft,
         connection_kind: ConnectionKind::Lan,
-        custom_relay: false,
     };
 
     let mut tab = 0;

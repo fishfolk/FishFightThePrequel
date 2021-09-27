@@ -27,7 +27,7 @@ pub use input::{Input, InputScheme};
 pub enum GameType {
     Local(Vec<InputScheme>),
     Network {
-        socket: std::net::UdpSocket,
+        socket: Box<dyn nodes::network::Socket>,
         id: usize,
         input_scheme: InputScheme,
     },
