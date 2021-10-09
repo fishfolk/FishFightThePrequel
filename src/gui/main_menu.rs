@@ -134,9 +134,6 @@ impl LanConnection {
         }
     }
 
-    pub fn connect(&mut self) {
-        self.socket.connect(&self.opponent_addr).unwrap();
-    }
     pub fn probe(&mut self) -> Option<()> {
         self.socket.connect(&self.opponent_addr).ok()?;
 
@@ -441,8 +438,6 @@ fn network_game_ui(ui: &mut ui::Ui, state: &mut NetworkUiState) -> Option<GameTy
         if connection.status == ConnectionStatus::Connected
             && ui.button(None, "Connect (A) (Enter)")
         {
-            connection.connect();
-
             return Some(GameType::Network {
                 socket: Box::new(connection.socket.try_clone().unwrap()),
                 id: if connection.local_addr > connection.opponent_addr {
