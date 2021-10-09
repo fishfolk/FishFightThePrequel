@@ -33,6 +33,7 @@ pub enum GameType {
     },
 }
 
+#[allow(dead_code)]
 struct Resources {
     hit_fxses: EmittersCache,
     explosion_fxses: EmittersCache,

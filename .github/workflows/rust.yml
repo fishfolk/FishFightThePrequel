@@ -15,17 +15,6 @@ jobs:
           command: fmt
           args: --all -- --check
 
-  clippy:
-    runs-on: ubuntu-latest
-    name: Linting
-    steps:
-      - uses: actions/checkout@v2
-      - name: Install Clippy
-        run: rustup component add clippy
-
-      - name: Run Clippy
-        run: cargo clippy -- -W clippy::correctness -D warnings
-
   build:
     name: Build
     runs-on: ${{ matrix.config.os }}
