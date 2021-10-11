@@ -1,0 +1,39 @@
+on: [push, pull_request]
+
+name: Compilation check
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    name: Formatting
+    steps:
+      - uses: actions/checkout@v2
+      - name: Check Rust formatting
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+  build:
+    name: Build
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { os: macos-latest, target: 'x86_64-apple-darwin' }
+          - { os: windows-latest, target: 'x86_64-pc-windows-msvc' }
+          - { os: ubuntu-latest, target: 'x86_64-pc-windows-gnu' }
+    steps:
+      - uses: actions/checkout@v2
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+      - uses: actions-rs/cargo@v1
+        with:
+          command: check

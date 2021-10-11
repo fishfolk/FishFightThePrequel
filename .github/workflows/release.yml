@@ -1,12 +1,11 @@
-on:
-  push:
-    branches:
-      - binaries
+on: [push]
+
 name: Make binaries
 
 jobs:
   build:
     name: Build
+    if: startsWith(github.event.head_commit.message, 'CI_BINARIES:')
     runs-on: ${{ matrix.config.os }}
     strategy:
       fail-fast: false
@@ -14,8 +13,10 @@ jobs:
         config:
           - { os: macos-latest, target: 'x86_64-apple-darwin', path: 'target/release/fishfight' }
           - { os: windows-latest, target: 'x86_64-pc-windows-msvc', path: 'target/release/fishfight.exe' }
-          - { os: ubuntu-latest, target: 'x86_64-pc-windows-gnu', path: 'target/release/fishfight' }
-
+          - { os: ubuntu-latest, target: 'x86_64-unknown-linux-gnu', path: 'target/release/fishfight' }
+        include:
+          - os: ubuntu-latest
+            packages: libx11-dev libxi-dev libgl1-mesa-dev  libasound2-dev
     steps:
       - uses: actions/checkout@v2
       - name: Cache Cargo dependencies
@@ -26,12 +27,20 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+      - name: Install packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get -yq --no-install-suggests --no-install-recommends install ${{ matrix.packages }}
       - uses: actions-rs/cargo@v1
         with:
-          command: build --release
-          args: --target=${{ matrix.config.target }}
+          command: build 
+          args: --release --features "steamworks"
+      - name: Strip
+        run: |
+           strip ${{ matrix.config.path }}
       - name: Upload artifacts
         uses: actions/upload-artifact@v2
         with:
           name: ${{ matrix.config.target }}
-          path: ${{ matrix.path }}
+          path: ${{ matrix.config.path }}
