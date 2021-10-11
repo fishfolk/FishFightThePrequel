@@ -37,38 +37,26 @@ impl Socket for std::net::UdpSocket {
 
 #[cfg(feature = "steamworks")]
 pub mod steam {
-    use steamworks::{Client, Networking, SendType, SteamId};
+    use fishsteam::{Steam, SteamId};
 
     pub struct SteamSocket {
-        pub client: Client,
-        pub networking: Networking<steamworks::ClientManager>,
+        pub steam: Steam,
         pub opponent_id: SteamId,
     }
     unsafe impl Send for SteamSocket {}
 
     impl super::Socket for SteamSocket {
         fn send(&self, buf: &[u8]) -> Option<usize> {
-            if self
-                .networking
-                .send_p2p_packet(self.opponent_id, SendType::Unreliable, buf)
-            {
-                return Some(buf.len());
-            }
-
-            None
+            self.steam.send(self.opponent_id, buf)
         }
 
         fn recv(&self, buf: &mut [u8]) -> Option<usize> {
-            if self.networking.is_p2p_packet_available().is_some() {
-                return self.networking.read_p2p_packet(buf).map(|(_, count)| count);
-            }
-            None
+            self.steam.try_recv(buf)
         }
 
         fn try_clone(&self) -> Option<Box<dyn super::Socket>> {
             let steam_socket = SteamSocket {
-                client: self.client.clone(),
-                networking: self.client.networking(),
+                steam: self.steam.clone(),
                 opponent_id: self.opponent_id.clone(),
             };
             Some(Box::new(steam_socket) as Box<dyn super::Socket>)

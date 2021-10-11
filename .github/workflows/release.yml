@@ -1,0 +1,37 @@
+on:
+  push:
+    branches:
+      - binaries
+name: Make binaries
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { os: macos-latest, target: 'x86_64-apple-darwin', path: 'target/release/fishfight' }
+          - { os: windows-latest, target: 'x86_64-pc-windows-msvc', path: 'target/release/fishfight.exe' }
+          - { os: ubuntu-latest, target: 'x86_64-pc-windows-gnu', path: 'target/release/fishfight' }
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build --release
+          args: --target=${{ matrix.config.target }}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ matrix.config.target }}
+          path: ${{ matrix.path }}

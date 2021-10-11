@@ -147,229 +147,12 @@ impl LanConnection {
     }
 }
 
-#[cfg(feature = "steamworks")]
-mod steam {
-    use std::sync::{Arc, Mutex};
-    use steamworks::{
-        CallbackHandle, ChatMemberStateChange, Client, LobbyChatUpdate, LobbyId, Matchmaking,
-        P2PSessionConnectFail, P2PSessionRequest, SingleClient, SteamId,
-    };
-
-    #[derive(Debug)]
-    pub enum Error {
-        SteamError(steamworks::SteamError),
-        WrongLobby,
-        NoOpponent,
-        CreateLobbyFailed,
-    }
-
-    impl From<steamworks::SteamError> for Error {
-        fn from(error: steamworks::SteamError) -> Error {
-            Error::SteamError(error)
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum SteamStatus {
-        WaitingForLobbies,
-        CreatingLobby,
-        WaitingForConnection(LobbyId),
-        Connecting,
-        Error(Error),
-        WaitingForProbe,
-        Ready,
-    }
-
-    pub struct SteamConnection {
-        pub client: Client<steamworks::ClientManager>,
-        pub self_id: SteamId,
-        pub opponent_id: Option<SteamId>,
-        single: SingleClient<steamworks::ClientManager>,
-        matchmaking: Matchmaking<steamworks::ClientManager>,
-        pub status: SteamStatus,
-        lobbies: Arc<Mutex<Option<Result<Vec<LobbyId>, steamworks::SteamError>>>>,
-        lobby_id: Arc<Mutex<Option<Result<LobbyId, ()>>>>,
-        incoming_connection: Arc<Mutex<Option<SteamId>>>,
-        _callbacks: Vec<CallbackHandle<steamworks::ClientManager>>,
-    }
-
-    impl SteamConnection {
-        pub fn new() -> Result<SteamConnection, Error> {
-            let (client, single) = Client::init()?;
-
-            let self_id = client.user().steam_id();
-            println!("Self user id: {:?}", self_id);
-
-            let mut _callbacks = vec![];
-            let cb = client.register_callback({
-                let client = client.clone();
-                move |p: P2PSessionRequest| {
-                    println!("Got P2PSessionRequest callback: {:?}", p);
-
-                    let networking = client.networking();
-                    networking.accept_p2p_session(p.remote);
-                }
-            });
-            _callbacks.push(cb);
-
-            let cb = client.register_callback({
-                move |p: P2PSessionConnectFail| {
-                    println!("Got P2PSessionConnectFail callback: {:?}", p);
-                }
-            });
-            _callbacks.push(cb);
-
-            let incoming_connection = Arc::new(Mutex::new(None));
-            let cb = client.register_callback({
-                let incoming_connection = incoming_connection.clone();
-
-                move |p: LobbyChatUpdate| {
-                    println!("Got LobbyChatUpdate callback: {:?}", p);
-
-                    match p.member_state_change {
-                        ChatMemberStateChange::Entered => {
-                            *incoming_connection.lock().unwrap() = Some(p.user_changed);
-                        }
-                        _ => {}
-                    }
-                }
-            });
-            _callbacks.push(cb);
-
-            let matchmaking = client.matchmaking();
-
-            let lobbies = Arc::new(Mutex::new(None));
-
-            matchmaking.request_lobby_list({
-                let lobbies = lobbies.clone();
-                move |res| {
-                    *lobbies.lock().unwrap() = Some(res);
-                }
-            });
-
-            Ok(SteamConnection {
-                client,
-                single,
-                self_id,
-                opponent_id: None,
-                matchmaking,
-                incoming_connection,
-                status: SteamStatus::WaitingForLobbies,
-                lobbies,
-                lobby_id: Arc::new(Mutex::new(None)),
-                _callbacks,
-            })
-        }
-
-        pub fn update(&mut self) {
-            self.single.run_callbacks();
-
-            match self.status {
-                SteamStatus::WaitingForLobbies => {
-                    if let Some(lobbies) = &*self.lobbies.lock().unwrap() {
-                        match lobbies {
-                            Ok(lobbies) if lobbies.is_empty() => {
-                                self.status = SteamStatus::CreatingLobby;
-                                let lobby_id = self.lobby_id.clone();
-                                self.matchmaking.create_lobby(
-                                    steamworks::LobbyType::Public,
-                                    2,
-                                    move |id| {
-                                        *lobby_id.lock().unwrap() = Some(id.map_err(|_| ()));
-                                    },
-                                );
-                            }
-                            Ok(lobbies) => {
-                                self.status = SteamStatus::Connecting;
-                                let lobby = self.lobby_id.clone();
-                                self.matchmaking.join_lobby(lobbies[0], move |res| {
-                                    *lobby.lock().unwrap() = Some(res);
-                                });
-                            }
-                            Err(err) => {
-                                self.status = SteamStatus::Error(err.clone().into());
-                            }
-                        }
-                    }
-                }
-                SteamStatus::WaitingForConnection(_) => {
-                    if let Some(opponent_id) = &*self.incoming_connection.lock().unwrap() {
-                        self.opponent_id = Some(*opponent_id);
-                        println!(
-                            "Ready to connect. Self_id: {:?}, opponent_id: {:?}",
-                            self.self_id,
-                            self.opponent_id.unwrap()
-                        );
-
-                        self.status = SteamStatus::WaitingForProbe;
-                        return;
-                    }
-                }
-                SteamStatus::CreatingLobby => {
-                    if let Some(lobby_id) = &*self.lobby_id.lock().unwrap() {
-                        match lobby_id {
-                            Err(_) => {
-                                self.status = SteamStatus::Error(Error::CreateLobbyFailed);
-                            }
-                            Ok(lobby) => {
-                                self.status = SteamStatus::WaitingForConnection(*lobby);
-                            }
-                        }
-                    }
-                }
-                SteamStatus::Connecting => {
-                    if let Some(Err(_)) = &*self.lobby_id.lock().unwrap() {
-                        self.status = SteamStatus::Error(Error::WrongLobby);
-                        return;
-                    }
-                    if let Some(Ok(lobby)) = &*self.lobby_id.lock().unwrap() {
-                        let opponents = self.matchmaking.lobby_members(*lobby);
-
-                        if opponents.len() != 2 {
-                            self.status = SteamStatus::Error(Error::WrongLobby);
-                            return;
-                        }
-                        println!("opponents: {:?}", opponents);
-
-                        let opponent = opponents.iter().find(|opponent| **opponent != self.self_id);
-                        if opponent.is_none() {
-                            self.status = SteamStatus::Error(Error::NoOpponent);
-                        }
-                        self.opponent_id = Some(*opponent.unwrap());
-
-                        println!(
-                            "Ready to connect. Self_id: {:?}, opponent_id: {:?}, in lobby {:?}",
-                            self.self_id,
-                            self.opponent_id.unwrap(),
-                            lobby
-                        );
-                        self.status = SteamStatus::WaitingForProbe;
-                    }
-                }
-                SteamStatus::WaitingForProbe => {
-                    if self.client.networking().is_p2p_packet_available().is_some() {
-                        self.status = SteamStatus::Ready;
-                    }
-                    let message = &nanoserde::SerBin::serialize_bin(&super::Message::Idle);
-                    self.client.networking().send_p2p_packet(
-                        self.opponent_id.unwrap(),
-                        steamworks::SendType::Unreliable,
-                        message,
-                    );
-                }
-                SteamStatus::Ready => {}
-                SteamStatus::Error(_) => {}
-            }
-        }
-    }
-}
-
 struct NetworkUiState {
     input_scheme: InputScheme,
     connection_kind: ConnectionKind,
     lan_connection: Option<LanConnection>,
     #[cfg(feature = "steamworks")]
-    steam_connection: Option<Result<steam::SteamConnection, steam::Error>>,
+    steam_connection: Option<Result<fishsteam::Steam, fishsteam::Error>>,
 }
 
 fn is_gamepad_btn_pressed(gui_resources: &GuiResources, btn: quad_gamepad::GamepadButton) -> bool {
@@ -453,7 +236,7 @@ fn network_game_ui(ui: &mut ui::Ui, state: &mut NetworkUiState) -> Option<GameTy
     #[cfg(feature = "steamworks")]
     if state.connection_kind == ConnectionKind::Steam {
         if state.steam_connection.is_none() {
-            state.steam_connection = Some(steam::SteamConnection::new());
+            state.steam_connection = Some(fishsteam::Steam::new());
         }
         let connection = state.steam_connection.as_mut().unwrap();
         match connection {
@@ -466,20 +249,20 @@ fn network_game_ui(ui: &mut ui::Ui, state: &mut NetworkUiState) -> Option<GameTy
             Ok(connection) => {
                 connection.update();
 
-                ui.label(None, &format!("Status: {:?}", connection.status));
+                ui.label(None, &format!("Status: {:?}", connection.status()));
 
-                if let steam::SteamStatus::Ready = connection.status {
+                if let fishsteam::SteamStatus::Ready = connection.status() {
                     if ui.button(None, "Connect") {
                         use crate::nodes::network::steam::SteamSocket;
 
-                        let opponent_id = connection.opponent_id.unwrap();
+                        let opponent_id = connection.opponent_id().unwrap();
                         return Some(GameType::Network {
                             socket: Box::new(SteamSocket {
-                                client: connection.client.clone(),
-                                networking: connection.client.networking(),
+                                steam: connection.clone(),
+                                //networking: connection.client.networking(),
                                 opponent_id,
                             }),
-                            id: if connection.self_id > opponent_id {
+                            id: if connection.self_id() > opponent_id {
                                 0
                             } else {
                                 1
