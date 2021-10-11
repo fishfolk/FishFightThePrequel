@@ -6,7 +6,7 @@ struct FishLibrary {
 
 impl FishLibrary {
     fn new() -> FishLibrary {
-        let lib = unsafe { libloading::Library::new("libfishsteam_sys.so").unwrap() };
+        let lib = unsafe { libloading::Library::new("libfishsteam_sys.module").unwrap() };
 
         FishLibrary { lib }
     }
