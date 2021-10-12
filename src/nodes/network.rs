@@ -93,6 +93,9 @@ pub struct Network {
     rx: mpsc::Receiver<Message>,
 
     self_id: usize,
+
+    game_started: bool,
+
     // all the inputs from the beginning of the game
     // will optimize memory later
     frames_buffer: Vec<[Option<Input>; 2]>,
@@ -189,6 +192,7 @@ impl Network {
             frame: Self::CONSTANT_DELAY as u64,
             tx,
             rx: rx1,
+            game_started: false,
             frames_buffer,
             acked_frames,
         }
@@ -248,26 +252,36 @@ impl Node for Network {
             }
         }
 
+        if node.game_started == false {
+            let mut all_packets_received = true;
+            for i in 0..Self::CONSTANT_DELAY {
+                all_packets_received &= node.frames_buffer[i][remote_id].is_some();
+            }
+            node.game_started = all_packets_received;
+        }
+
         // we have an input for "-CONSTANT_DELAY" frame, so we can
         // advance the simulation
-        if let [Some(p1_input), Some(p2_input)] =
-            node.frames_buffer[node.frame as usize - Self::CONSTANT_DELAY]
-        {
-            scene::get_node(node.player1).apply_input(p1_input);
-            scene::get_node(node.player2).apply_input(p2_input);
+        if node.game_started {
+            if let [Some(p1_input), Some(p2_input)] =
+                node.frames_buffer[node.frame as usize - Self::CONSTANT_DELAY]
+            {
+                scene::get_node(node.player1).apply_input(p1_input);
+                scene::get_node(node.player2).apply_input(p2_input);
 
-            // advance the simulation
-            for NodeWith { node, capability } in scene::find_nodes_with::<NetworkReplicate>() {
-                (capability.network_update)(node);
-            }
+                // advance the simulation
+                for NodeWith { node, capability } in scene::find_nodes_with::<NetworkReplicate>() {
+                    (capability.network_update)(node);
+                }
 
-            if node.frame >= node.frames_buffer.len() as _ {
-                node.frames_buffer
-                    .resize(node.frame as usize + 1, [None, None]);
-                node.acked_frames.resize(node.frame as usize + 1, false);
+                if node.frame >= node.frames_buffer.len() as _ {
+                    node.frames_buffer
+                        .resize(node.frame as usize + 1, [None, None]);
+                    node.acked_frames.resize(node.frame as usize + 1, false);
+                }
+                node.frames_buffer[node.frame as usize][node.self_id] = Some(own_input);
+                node.frame += 1;
             }
-            node.frames_buffer[node.frame as usize][node.self_id] = Some(own_input);
-            node.frame += 1;
         }
     }
 }
