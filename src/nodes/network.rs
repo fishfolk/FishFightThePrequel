@@ -135,9 +135,9 @@ impl Network {
                 loop {
                     let mut data = [0; 256];
                     if let Some(count) = socket.recv(&mut data) {
-                        let message = DeBin::deserialize_bin(&data[0..count]).unwrap();
-
-                        tx1.send(message).unwrap();
+                        if let Ok(message) = DeBin::deserialize_bin(&data[0..count]) {
+                            tx1.send(message).unwrap();
+                        }
                     }
                 }
             });
